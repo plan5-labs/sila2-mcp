@@ -46,3 +46,7 @@ claude mcp add sila2 -- uv --directory /path/to/sila2-mcp run sila2-mcp
 The server talks MCP over stdio. Connections to the SiLA 2 servers are opened on first use
 and kept; after a SiLA 2 server restarts, the next failing call drops the connection and the
 following call reconnects.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
