@@ -1,0 +1,26 @@
+# SiLA 2 servers this MCP server talks to. The table name is the server name used by the tools.
+# insecure = true connects without TLS (the servers run with --insecure / EnableTLS=false).
+
+[servers.ardea]
+host = "127.0.0.1"
+port = 50053
+insecure = true
+description = "Ardea robot (ardea-sila2): carriage, DENSO arm and hand; moves plates between stations"
+
+[servers.atc]
+host = "127.0.0.1"
+port = 5140
+insecure = true
+description = "Thermo Fisher ATC thermal cycler (atc-sila2)"
+
+[servers.centrifuge]
+host = "127.0.0.1"
+port = 5218
+insecure = true
+description = "Agilent centrifuge with loader (MicroplateCentrifuge-sila2)"
+
+[servers.xpeel]
+host = "127.0.0.1"
+port = 50052
+insecure = true
+description = "Azenta XPeel plate seal remover (xpeel-sila2)"

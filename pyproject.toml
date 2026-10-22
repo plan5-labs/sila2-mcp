@@ -1,0 +1,20 @@
+[project]
+name = "sila2-mcp"
+version = "0.1.0"
+description = "MCP server that exposes SiLA 2 servers' properties and commands as MCP tools"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=2.0",
+    "sila2>=0.14.0",
+]
+
+[project.scripts]
+sila2-mcp = "sila2_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sila2_mcp"]
