@@ -49,4 +49,4 @@ following call reconnects.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT License. Copyright (c) 2026 RIKEN. See [LICENSE](LICENSE).
