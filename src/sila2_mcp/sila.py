@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from sila2.client import SilaClient
+from sila2.framework import ValidationError
 
 # The sila2 client warns on every observable command whose lifetime the server shortens.
 warnings.filterwarnings("ignore", message="Server shortened the lifetime")
@@ -353,6 +354,53 @@ def _error(e: BaseException) -> dict[str, Any]:
     return info
 
 
+def _resolved_type_str(data_type: ET.Element | None, root: ET.Element) -> str:
+    """Like _type_str, but a named data type is followed by its definition: "Name = Real (...)"."""
+    s = _type_str(data_type)
+    inner = None if data_type is None else next(iter(data_type), None)
+    if inner is not None and _local(inner.tag) == "DataTypeIdentifier":
+        for d in _children(root, "DataTypeDefinition"):
+            if _text(d, "Identifier") == s:
+                return f"{s} = {_type_str(_child(d, 'DataType'))}"
+    return s
+
+
+def _validation_details(
+    e: ValidationError, attr: Any, root: ET.Element, node: ET.Element, parameters: dict[str, Any]
+) -> dict[str, Any]:
+    """Name the rejected parameter and its allowed type.
+
+    A server-side ValidationError carries the parameter; one the sila2 client raises itself
+    (a constraint checked before sending) does not, so each parameter is checked on its own.
+    """
+    param = None
+    fqi = getattr(e, "parameter_fully_qualified_identifier", None)
+    if fqi is not None:
+        param = str(fqi).rsplit("/", 1)[-1]
+    else:
+        try:
+            fields = attr._wrapped_command.parameters.fields
+        except AttributeError:
+            fields = []
+        for f in fields:
+            if f._identifier not in parameters:
+                continue
+            try:
+                f.data_type.to_message(parameters[f._identifier], toplevel_named_data_node=f)
+            except ValidationError:
+                param = f._identifier
+                break
+            except Exception:
+                pass
+    if param is None:
+        return {}
+    details: dict[str, Any] = {"parameter": param, "message": f"Parameter {param} rejected: {getattr(e, 'message', e)}"}
+    for p in _children(node, "Parameter"):
+        if _text(p, "Identifier") == param:
+            details["expected"] = _resolved_type_str(_child(p, "DataType"), root)
+    return details
+
+
 # --- lookups ---------------------------------------------------------------------------------------
 
 
@@ -452,7 +500,10 @@ def call_command(
     try:
         result = attr(**parameters)
     except Exception as e:
-        return {**base, "ok": False, "seconds": round(time.monotonic() - started, 1), "error": _error(e)}
+        error = _error(e)
+        if isinstance(e, ValidationError):
+            error.update(_validation_details(e, attr, root, node, parameters))
+        return {**base, "ok": False, "seconds": round(time.monotonic() - started, 1), "error": error}
 
     if not hasattr(result, "execution_uuid"):  # unobservable: the call returned the responses
         return {**base, "ok": True, "seconds": round(time.monotonic() - started, 1), "responses": to_jsonable(result, sink)}
