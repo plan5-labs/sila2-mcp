@@ -21,7 +21,9 @@ mcp = MCPServer(
     "sila2",
     instructions=(
         "Tools for SiLA 2 lab instruments. list_servers, describe_server and get_property are "
-        "read-only. call_command may move hardware: confirm with the user before each motion."
+        "read-only. call_command may move hardware: confirm with the user before each motion. "
+        "To learn a server, call describe_server with brief=true first, then with feature=... for "
+        "the parameters and types of the feature you need."
     ),
 )
 _pool: sila.Pool | None = None
@@ -81,16 +83,23 @@ async def list_servers() -> list[dict[str, Any]]:
 
 
 @mcp.tool()
-async def describe_server(server: str, include_standard: bool = False) -> dict[str, Any]:
+async def describe_server(
+    server: str,
+    feature: str | None = None,
+    brief: bool = False,
+    include_standard: bool = False,
+) -> dict[str, Any]:
     """Describe one server's features: commands (observable or not, parameters, responses,
     intermediate responses, defined errors), properties, custom data types (a type named in a
     parameter or response, e.g. "StreamName", is defined under `data_types`) and defined
     execution errors, with their FDL descriptions.
 
     Read-only. Use it to learn parameter names and types before call_command.
+    The full description can be long: `brief=true` lists only each feature's command and
+    property names with a one-sentence summary; `feature` returns just that feature.
     The SiLAService feature every server implements is left out unless `include_standard`.
     """
-    return await _run(sila.describe, _get_pool(), server, include_standard)
+    return await _run(sila.describe, _get_pool(), server, feature, brief, include_standard)
 
 
 @mcp.tool()
@@ -98,6 +107,7 @@ async def get_property(server: str, property: str, feature: str | None = None) -
     """Read a property's current value once (observable properties too).
 
     Read-only. `feature` is needed only when two features of the server share the property name.
+    A Binary value is written to a file, as described for call_command.
     """
     return await _run(sila.get_property, _get_pool(), server, property, feature)
 
@@ -117,8 +127,11 @@ async def call_command(
     intermediate responses are collected and returned. On failure, `ok` is false and
     `error` holds the SiLA error (defined execution error identifier and message).
     `feature` is needed only when two features of the server share the command name.
-    Binary responses (images, videos, data files) are written to files; the result holds
-    {"file", "content_type", "length"} instead of the bytes.
+    Binary responses (images, videos, data files) are written to local files; the result holds
+    {"file", "content_type", "length"} instead of the bytes, so nothing of the content reaches
+    the model unless the file is opened afterwards (e.g. reading an image, which sends it to the
+    model like any other image in the conversation). Files are kept until deleted by hand;
+    sila2-mcp never removes them.
     """
     return await _run(sila.call_command, _get_pool(), server, command, parameters, feature, timeout_s)
 
@@ -138,7 +151,7 @@ def main() -> None:
 
     global _pool
     config = sila.load_config(args.config, args.output_dir)
-    _pool = sila.Pool(config.servers, config.output_dir)
+    _pool = sila.Pool(config.servers, config.output_dir, config.path)
     mcp.run()
 
 

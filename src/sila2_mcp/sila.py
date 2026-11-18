@@ -11,6 +11,7 @@ import decimal
 import enum
 import mimetypes
 import os
+import re
 import threading
 import time
 import tomllib
@@ -50,6 +51,7 @@ def default_output_dir() -> Path:
 class Config:
     servers: dict[str, ServerConfig]
     output_dir: Path  # where Binary values from the servers are written
+    path: Path | None = None  # the file the configuration was read from
 
 
 def load_config(path: str | os.PathLike | None = None, output_dir: str | os.PathLike | None = None) -> Config:
@@ -72,7 +74,11 @@ def load_config(path: str | os.PathLike | None = None, output_dir: str | os.Path
             description=entry.get("description", ""),
         )
     out = output_dir or os.environ.get("SILA2_MCP_OUTPUT_DIR") or data.get("output_dir")
-    return Config(servers=servers, output_dir=Path(out).expanduser() if out else default_output_dir())
+    return Config(
+        servers=servers,
+        output_dir=Path(out).expanduser() if out else default_output_dir(),
+        path=path.resolve(),
+    )
 
 
 class SilaError(Exception):
@@ -82,9 +88,15 @@ class SilaError(Exception):
 class Pool:
     """One SilaClient per configured server, connected on first use and reconnected after a failure."""
 
-    def __init__(self, servers: dict[str, ServerConfig], output_dir: str | os.PathLike | None = None):
+    def __init__(
+        self,
+        servers: dict[str, ServerConfig],
+        output_dir: str | os.PathLike | None = None,
+        config_path: str | os.PathLike | None = None,
+    ):
         self.servers = servers
         self.output_dir = Path(output_dir) if output_dir else default_output_dir()
+        self.config_path = Path(config_path) if config_path else None
         self._clients: dict[str, SilaClient] = {}
         self._lock = threading.Lock()
 
@@ -100,7 +112,12 @@ class Pool:
                 try:
                     self._clients[server] = SilaClient(cfg.host, cfg.port, **kwargs)
                 except Exception as e:
-                    raise SilaError(f"cannot connect to {server} at {cfg.host}:{cfg.port}: {type(e).__name__}: {e}") from e
+                    where = f" (set in {self.config_path})" if self.config_path else ""
+                    raise SilaError(
+                        f"cannot connect to {server} at {cfg.host}:{cfg.port}: {type(e).__name__}: {e}. "
+                        f"Check that the SiLA 2 server process for {server} is running and listening on "
+                        f"{cfg.host}:{cfg.port}{where}, with TLS {'off' if cfg.insecure else 'on'} as configured."
+                    ) from e
             return self._clients[server]
 
     def drop(self, server: str) -> None:
@@ -208,17 +225,57 @@ def _data_types(root: ET.Element) -> list[dict[str, Any]]:
     return out
 
 
-def describe(pool: Pool, server: str, include_standard: bool = False) -> dict[str, Any]:
+def _first_sentence(text: str) -> str:
+    match = re.search(r"(?<=[.!?])\s", text)
+    return text[: match.start()] if match else text
+
+
+def _brief(identifier: str, root: ET.Element) -> dict[str, Any]:
+    return {
+        "identifier": identifier,
+        "description": _first_sentence(_text(root, "Description")),
+        "commands": [
+            {
+                "identifier": _text(c, "Identifier"),
+                "observable": _text(c, "Observable") == "Yes",
+                "summary": _first_sentence(_text(c, "Description")),
+            }
+            for c in _children(root, "Command")
+        ],
+        "properties": [
+            {"identifier": _text(p, "Identifier"), "summary": _first_sentence(_text(p, "Description"))}
+            for p in _children(root, "Property")
+        ],
+    }
+
+
+def describe(
+    pool: Pool,
+    server: str,
+    feature: str | None = None,
+    brief: bool = False,
+    include_standard: bool = False,
+) -> dict[str, Any]:
     """Features with their commands, properties, data types and errors.
 
-    The SiLAService feature, which every server implements, is left out unless `include_standard`.
+    `feature` limits the result to one feature. `brief` lists only command and property names
+    with the first sentence of their descriptions. The SiLAService feature, which every server
+    implements, is left out unless `include_standard` or asked for by `feature`.
     """
     client = pool.client(server)
+    if feature is not None and feature not in client._features:
+        raise SilaError(f"{server} has no feature {feature!r}; features: {sorted(client._features)}")
     features = []
-    for identifier, feature in client._features.items():
-        if identifier in _STANDARD_FEATURES and not include_standard:
+    for identifier, feat in client._features.items():
+        if feature is not None:
+            if identifier != feature:
+                continue
+        elif identifier in _STANDARD_FEATURES and not include_standard:
             continue
-        root = ET.fromstring(feature._feature_definition)
+        root = ET.fromstring(feat._feature_definition)
+        if brief:
+            features.append(_brief(identifier, root))
+            continue
         commands = []
         for cmd in _children(root, "Command"):
             commands.append(

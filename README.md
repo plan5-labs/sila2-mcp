@@ -11,7 +11,7 @@ discovered from the server itself (`sila2` Python client), so no per-instrument 
 | Tool | Moves hardware? | What it does |
 |---|---|---|
 | `list_servers` | no | The configured servers and whether each answers now |
-| `describe_server(server, include_standard?)` | no | Features, commands (observable or not, parameters, responses, errors), properties, custom data types and defined errors; `SiLAService` only with `include_standard` |
+| `describe_server(server, feature?, brief?, include_standard?)` | no | Features, commands (observable or not, parameters, responses, errors), properties, custom data types and defined errors. `brief` lists only names with a one-sentence summary; `feature` limits it to one feature; `SiLAService` only with `include_standard` |
 | `get_property(server, property, feature?)` | no | Read a property once |
 | `call_command(server, command, parameters?, feature?, timeout_s?)` | **may** | Run a command; an observable one is waited for and its intermediate responses collected |
 
@@ -23,7 +23,8 @@ its reason.
 Binary values (images, videos, data files) are written to the output directory and
 appear in the result as `{"file": ..., "content_type": ..., "length": ...}`, so they do not
 enter the client's context. The content type comes from the FDL `ContentType` constraint,
-otherwise from the file's leading bytes.
+otherwise from the file's leading bytes. The content reaches the model only if the client
+opens the file afterwards (e.g. reads an image).
 
 Keep `call_command` behind a confirmation in your MCP client's permissions and allow
 the read-only tools.
