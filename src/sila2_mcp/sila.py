@@ -9,6 +9,7 @@ import base64
 import datetime
 import decimal
 import enum
+import mimetypes
 import os
 import threading
 import time
@@ -39,8 +40,23 @@ class ServerConfig:
     description: str = ""
 
 
-def load_config(path: str | os.PathLike | None = None) -> dict[str, ServerConfig]:
-    """Read the server table from `path`, $SILA2_MCP_CONFIG, or ./servers.toml."""
+def default_output_dir() -> Path:
+    base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".local", "share")
+    return Path(base) / "sila2-mcp" / "files"
+
+
+@dataclass(frozen=True)
+class Config:
+    servers: dict[str, ServerConfig]
+    output_dir: Path  # where Binary values from the servers are written
+
+
+def load_config(path: str | os.PathLike | None = None, output_dir: str | os.PathLike | None = None) -> Config:
+    """Read the configuration from `path`, $SILA2_MCP_CONFIG, or ./servers.toml.
+
+    The output directory is `output_dir`, else $SILA2_MCP_OUTPUT_DIR, else the file's top-level
+    `output_dir`, else default_output_dir().
+    """
     path = Path(path or os.environ.get("SILA2_MCP_CONFIG") or "servers.toml")
     with open(path, "rb") as f:
         data = tomllib.load(f)
@@ -54,7 +70,8 @@ def load_config(path: str | os.PathLike | None = None) -> dict[str, ServerConfig
             root_cert=entry.get("root_cert"),
             description=entry.get("description", ""),
         )
-    return servers
+    out = output_dir or os.environ.get("SILA2_MCP_OUTPUT_DIR") or data.get("output_dir")
+    return Config(servers=servers, output_dir=Path(out).expanduser() if out else default_output_dir())
 
 
 class SilaError(Exception):
@@ -64,8 +81,9 @@ class SilaError(Exception):
 class Pool:
     """One SilaClient per configured server, connected on first use and reconnected after a failure."""
 
-    def __init__(self, servers: dict[str, ServerConfig]):
+    def __init__(self, servers: dict[str, ServerConfig], output_dir: str | os.PathLike | None = None):
         self.servers = servers
+        self.output_dir = Path(output_dir) if output_dir else default_output_dir()
         self._clients: dict[str, SilaClient] = {}
         self._lock = threading.Lock()
 
@@ -118,6 +136,17 @@ def _text(node: ET.Element | None, name: str) -> str:
     return " ".join((c.text or "").split()) if c is not None else ""
 
 
+def _constraint_str(c: ET.Element) -> str:
+    kind = _local(c.tag)
+    if kind == "ContentType":
+        return f"ContentType={_text(c, 'Type')}/{_text(c, 'Subtype')}"
+    if kind == "Unit":
+        return f"Unit={_text(c, 'Label')}"
+    if len(c):
+        return f"{kind}={'|'.join((v.text or '').strip() for v in c if (v.text or '').strip())}"
+    return f"{kind}={(c.text or '').strip()}"
+
+
 def _type_str(data_type: ET.Element | None) -> str:
     """A compact, readable rendering of an FDL <DataType>."""
     if data_type is None:
@@ -137,9 +166,7 @@ def _type_str(data_type: ET.Element | None) -> str:
         constraints = _child(inner, "Constraints")
         parts = []
         if constraints is not None:
-            for c in constraints:
-                values = [v.text for v in c if v.text] if len(c) else []
-                parts.append(f"{_local(c.tag)}={'|'.join(values) if values else (c.text or '').strip()}")
+            parts = [_constraint_str(c) for c in constraints]
         return f"{base} ({', '.join(parts)})" if parts else base
     if kind == "Structure":
         fields = [f"{_text(e, 'Identifier')}: {_type_str(_child(e, 'DataType'))}" for e in _children(inner, "Element")]
@@ -163,10 +190,33 @@ def _error_ids(command: ET.Element) -> list[str]:
     return [] if errors is None else [(e.text or "").strip() for e in errors]
 
 
-def describe(pool: Pool, server: str) -> dict[str, Any]:
+def _data_types(root: ET.Element) -> list[dict[str, Any]]:
+    out = []
+    for d in _children(root, "DataTypeDefinition"):
+        data_type = _child(d, "DataType")
+        entry: dict[str, Any] = {
+            "identifier": _text(d, "Identifier"),
+            "type": _type_str(data_type),
+            "description": _text(d, "Description"),
+        }
+        structure = None if data_type is None else _child(data_type, "Structure")
+        if structure is not None:  # the fields carry their descriptions; no need for the inline form
+            entry["type"] = "Structure"
+            entry["fields"] = _elements(structure, "Element")
+        out.append(entry)
+    return out
+
+
+def describe(pool: Pool, server: str, include_standard: bool = False) -> dict[str, Any]:
+    """Features with their commands, properties, data types and errors.
+
+    The SiLAService feature, which every server implements, is left out unless `include_standard`.
+    """
     client = pool.client(server)
     features = []
     for identifier, feature in client._features.items():
+        if identifier in _STANDARD_FEATURES and not include_standard:
+            continue
         root = ET.fromstring(feature._feature_definition)
         commands = []
         for cmd in _children(root, "Command"):
@@ -196,6 +246,11 @@ def describe(pool: Pool, server: str) -> dict[str, Any]:
                 "description": _text(root, "Description"),
                 "commands": commands,
                 "properties": properties,
+                "data_types": _data_types(root),
+                "errors": [
+                    {"identifier": _text(e, "Identifier"), "description": _text(e, "Description")}
+                    for e in _children(root, "DefinedExecutionError")
+                ],
             }
         )
     return {"server": server, "features": features}
@@ -204,17 +259,78 @@ def describe(pool: Pool, server: str) -> dict[str, Any]:
 # --- values ----------------------------------------------------------------------------------------
 
 
-def to_jsonable(value: Any) -> Any:
-    """Turn sila2 client values (namedtuples, bytes, dates, ...) into JSON-compatible ones."""
+_EXTENSIONS = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/tiff": ".tif",
+    "video/mp4": ".mp4",
+    "application/pdf": ".pdf",
+    "application/zip": ".zip",
+    "application/xml": ".xml",
+    "application/json": ".json",
+    "text/plain": ".txt",
+    "text/csv": ".csv",
+    "application/octet-stream": ".bin",
+}
+
+
+def _sniff(data: bytes) -> str:
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data[:4] in (b"II*\x00", b"MM\x00*"):
+        return "image/tiff"
+    if data[4:8] == b"ftyp":
+        return "video/mp4"
+    if data.startswith(b"%PDF"):
+        return "application/pdf"
+    if data.startswith(b"PK\x03\x04"):
+        return "application/zip"
+    return "application/octet-stream"
+
+
+class BinarySink:
+    """Writes Binary values to files so a result carries a path instead of the bytes.
+
+    `hints` maps a response (or property) identifier to the content type its FDL declares;
+    other binaries are typed by their leading bytes.
+    """
+
+    def __init__(self, directory: Path, prefix: str, hints: dict[str, str] | None = None):
+        self.directory = directory
+        self.prefix = prefix
+        self.hints = hints or {}
+
+    def __call__(self, data: bytes, field: str | None) -> dict[str, Any]:
+        content_type = self.hints.get(field or "") or _sniff(data)
+        ext = _EXTENSIONS.get(content_type) or mimetypes.guess_extension(content_type) or ".bin"
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        name = "_".join(p for p in (self.prefix, stamp, field) if p)
+        name = "".join(ch if ch.isalnum() or ch in "-_." else "-" for ch in name) + ext
+        self.directory.mkdir(parents=True, exist_ok=True)
+        path = self.directory / name
+        path.write_bytes(data)
+        return {"file": str(path), "content_type": content_type, "length": len(data)}
+
+
+def to_jsonable(value: Any, sink: BinarySink | None = None, field: str | None = None) -> Any:
+    """Turn sila2 client values (namedtuples, bytes, dates, ...) into JSON-compatible ones.
+
+    Bytes go to `sink` (a file) when given, else into the result as base64.
+    `field` is the identifier of the innermost named element, used as a content-type hint.
+    """
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     if isinstance(value, tuple) and hasattr(value, "_asdict"):
-        return {k: to_jsonable(v) for k, v in value._asdict().items()}
+        return {k: to_jsonable(v, sink, k) for k, v in value._asdict().items()}
     if isinstance(value, (list, tuple, set)):
-        return [to_jsonable(v) for v in value]
+        return [to_jsonable(v, sink, field) for v in value]
     if isinstance(value, dict):
-        return {str(k): to_jsonable(v) for k, v in value.items()}
+        return {str(k): to_jsonable(v, sink, str(k)) for k, v in value.items()}
     if isinstance(value, (bytes, bytearray)):
+        if sink is not None:
+            return sink(bytes(value), field)
         return {"base64": base64.b64encode(value).decode("ascii"), "length": len(value)}
     if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
         return value.isoformat()
@@ -241,7 +357,7 @@ def _error(e: BaseException) -> dict[str, Any]:
 
 
 def _find(pool: Pool, server: str, feature: str | None, member: str, kind: str):
-    """Return (feature identifier, client attribute) for a command or property name."""
+    """Return (feature identifier, client attribute, FDL root, FDL node) for a command or property name."""
     client = pool.client(server)
     if feature:
         if feature not in client._features:
@@ -262,7 +378,42 @@ def _find(pool: Pool, server: str, feature: str | None, member: str, kind: str):
     if not feature and len(non_standard) > 1:
         raise SilaError(f"{kind.lower()} {member!r} exists in several features {non_standard}; pass feature")
     fid = (non_standard or matches)[0]
-    return fid, getattr(getattr(client, fid), member)
+    root = ET.fromstring(client._features[fid]._feature_definition)
+    node = next(n for n in _children(root, kind) if _text(n, "Identifier") == member)
+    return fid, getattr(getattr(client, fid), member), root, node
+
+
+def _content_type(data_type: ET.Element | None, root: ET.Element, depth: int = 0) -> str | None:
+    """The ContentType constraint of a (possibly constrained or named) Binary type, if any."""
+    if data_type is None or depth > 10:
+        return None
+    inner = next(iter(data_type), None)
+    if inner is None:
+        return None
+    kind = _local(inner.tag)
+    if kind == "Constrained":
+        constraints = _child(inner, "Constraints")
+        c = None if constraints is None else _child(constraints, "ContentType")
+        if c is not None:
+            return f"{_text(c, 'Type')}/{_text(c, 'Subtype')}".lower()
+        return _content_type(_child(inner, "DataType"), root, depth + 1)
+    if kind == "DataTypeIdentifier":
+        name = (inner.text or "").strip()
+        for d in _children(root, "DataTypeDefinition"):
+            if _text(d, "Identifier") == name:
+                return _content_type(_child(d, "DataType"), root, depth + 1)
+    return None
+
+
+def _hints(root: ET.Element, node: ET.Element, element_kinds: tuple[str, ...]) -> dict[str, str]:
+    """Identifier -> declared content type, for the Binary elements of a command."""
+    hints = {}
+    for kind in element_kinds:
+        for e in _children(node, kind):
+            ct = _content_type(_child(e, "DataType"), root)
+            if ct:
+                hints[_text(e, "Identifier")] = ct
+    return hints
 
 
 # --- calls -----------------------------------------------------------------------------------------
@@ -270,14 +421,16 @@ def _find(pool: Pool, server: str, feature: str | None, member: str, kind: str):
 
 def get_property(pool: Pool, server: str, prop: str, feature: str | None = None) -> dict[str, Any]:
     try:
-        fid, attr = _find(pool, server, feature, prop, "Property")
+        fid, attr, root, node = _find(pool, server, feature, prop, "Property")
         value = attr.get()
     except SilaError:
         raise
     except Exception as e:
         pool.drop(server)
         return {"ok": False, "server": server, "property": prop, "error": _error(e)}
-    return {"ok": True, "server": server, "feature": fid, "property": prop, "value": to_jsonable(value)}
+    ct = _content_type(_child(node, "DataType"), root)
+    sink = BinarySink(pool.output_dir, f"{server}_{prop}", {prop: ct} if ct else None)
+    return {"ok": True, "server": server, "feature": fid, "property": prop, "value": to_jsonable(value, sink, prop)}
 
 
 def call_command(
@@ -290,7 +443,10 @@ def call_command(
 ) -> dict[str, Any]:
     """Run a command; for an observable one, wait until it finishes (or `timeout_s` passes)."""
     parameters = parameters or {}
-    fid, attr = _find(pool, server, feature, command, "Command")
+    fid, attr, root, node = _find(pool, server, feature, command, "Command")
+    sink = BinarySink(
+        pool.output_dir, f"{server}_{command}", _hints(root, node, ("Response", "IntermediateResponse"))
+    )
     base = {"server": server, "feature": fid, "command": command, "parameters": parameters}
     started = time.monotonic()
     try:
@@ -299,14 +455,14 @@ def call_command(
         return {**base, "ok": False, "seconds": round(time.monotonic() - started, 1), "error": _error(e)}
 
     if not hasattr(result, "execution_uuid"):  # unobservable: the call returned the responses
-        return {**base, "ok": True, "seconds": round(time.monotonic() - started, 1), "responses": to_jsonable(result)}
+        return {**base, "ok": True, "seconds": round(time.monotonic() - started, 1), "responses": to_jsonable(result, sink)}
 
     instance = result
     intermediate: list[Any] = []
     subscription = None
     try:
         subscription = instance.subscribe_to_intermediate_responses()
-        subscription.add_callback(lambda item: intermediate.append(to_jsonable(item)))
+        subscription.add_callback(lambda item: intermediate.append(to_jsonable(item, sink)))
     except Exception:
         subscription = None  # the command has no intermediate responses
 
@@ -337,6 +493,6 @@ def call_command(
         **base,
         "ok": True,
         "seconds": seconds,
-        "responses": to_jsonable(responses),
+        "responses": to_jsonable(responses, sink),
         "intermediate_responses": intermediate,
     }

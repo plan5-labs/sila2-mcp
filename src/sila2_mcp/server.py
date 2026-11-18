@@ -13,6 +13,7 @@ from typing import Any
 
 import anyio
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from . import sila
 
@@ -57,6 +58,18 @@ def _list_servers() -> list[dict[str, Any]]:
 # in a worker thread and the MCP event loop stays responsive during long commands.
 
 
+async def _run(fn, *args):
+    """Run `fn` in a worker thread; a SilaError reaches the client with its message.
+
+    MCPServer reports any other exception as a bare "Error executing tool" and keeps the
+    text on the server, so the client could not tell e.g. an unknown server from a crash.
+    """
+    try:
+        return await anyio.to_thread.run_sync(fn, *args)
+    except sila.SilaError as e:
+        raise ToolError(str(e)) from e
+
+
 @mcp.tool()
 async def list_servers() -> list[dict[str, Any]]:
     """List the configured SiLA 2 servers and whether each one answers right now.
@@ -64,17 +77,20 @@ async def list_servers() -> list[dict[str, Any]]:
     Read-only. Tries to connect to each server; a server that does not answer is reported
     with its error instead of failing the whole call.
     """
-    return await anyio.to_thread.run_sync(_list_servers)
+    return await _run(_list_servers)
 
 
 @mcp.tool()
-async def describe_server(server: str) -> dict[str, Any]:
+async def describe_server(server: str, include_standard: bool = False) -> dict[str, Any]:
     """Describe one server's features: commands (observable or not, parameters, responses,
-    intermediate responses, defined errors) and properties, with their FDL descriptions.
+    intermediate responses, defined errors), properties, custom data types (a type named in a
+    parameter or response, e.g. "StreamName", is defined under `data_types`) and defined
+    execution errors, with their FDL descriptions.
 
     Read-only. Use it to learn parameter names and types before call_command.
+    The SiLAService feature every server implements is left out unless `include_standard`.
     """
-    return await anyio.to_thread.run_sync(sila.describe, _get_pool(), server)
+    return await _run(sila.describe, _get_pool(), server, include_standard)
 
 
 @mcp.tool()
@@ -83,7 +99,7 @@ async def get_property(server: str, property: str, feature: str | None = None) -
 
     Read-only. `feature` is needed only when two features of the server share the property name.
     """
-    return await anyio.to_thread.run_sync(sila.get_property, _get_pool(), server, property, feature)
+    return await _run(sila.get_property, _get_pool(), server, property, feature)
 
 
 @mcp.tool()
@@ -101,22 +117,28 @@ async def call_command(
     intermediate responses are collected and returned. On failure, `ok` is false and
     `error` holds the SiLA error (defined execution error identifier and message).
     `feature` is needed only when two features of the server share the command name.
+    Binary responses (images, videos, data files) are written to files; the result holds
+    {"file", "content_type", "length"} instead of the bytes.
     """
-    return await anyio.to_thread.run_sync(
-        sila.call_command, _get_pool(), server, command, parameters, feature, timeout_s
-    )
+    return await _run(sila.call_command, _get_pool(), server, command, parameters, feature, timeout_s)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="MCP server for SiLA 2 servers")
     parser.add_argument("--config", help="servers.toml (default: $SILA2_MCP_CONFIG or ./servers.toml)")
+    parser.add_argument(
+        "--output-dir",
+        help="where Binary responses are written (default: $SILA2_MCP_OUTPUT_DIR, output_dir in the "
+        "config, or %%LOCALAPPDATA%%/sila2-mcp/files)",
+    )
     args = parser.parse_args()
 
     # stdout carries the MCP protocol; everything else goes to stderr.
     logging.basicConfig(stream=sys.stderr, level=logging.WARNING)
 
     global _pool
-    _pool = sila.Pool(sila.load_config(args.config))
+    config = sila.load_config(args.config, args.output_dir)
+    _pool = sila.Pool(config.servers, config.output_dir)
     mcp.run()
 
 
