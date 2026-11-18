@@ -1,6 +1,13 @@
 # SiLA 2 servers this MCP server talks to. The table name is the server name used by the tools.
 # insecure = true connects without TLS (the servers run with --insecure / EnableTLS=false).
 
+# Asking the user before a call (see README "Confirmation"). Modes: none | every | once.
+# A server can override the modes with confirm = { commands = "...", properties = "..." }.
+[confirm]
+commands = "once"              # ask once per command, then not again for approval_ttl_minutes
+properties = "none"            # reading a property does not ask
+approval_ttl_minutes = 30      # or "unlimited"
+
 [servers.ardea]
 host = "127.0.0.1"
 port = 50053
