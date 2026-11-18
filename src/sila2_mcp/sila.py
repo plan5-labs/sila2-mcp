@@ -25,6 +25,8 @@ from typing import Any
 from sila2.client import SilaClient
 from sila2.framework import ValidationError
 
+from . import approval
+
 # The sila2 client warns on every observable command whose lifetime the server shortens.
 warnings.filterwarnings("ignore", message="Server shortened the lifetime")
 
@@ -40,6 +42,7 @@ class ServerConfig:
     insecure: bool = True
     root_cert: str | None = None
     description: str = ""
+    policy: approval.Policy = approval.Policy()  # confirmation modes for this server
 
 
 def default_output_dir() -> Path:
@@ -52,19 +55,50 @@ class Config:
     servers: dict[str, ServerConfig]
     output_dir: Path  # where Binary values from the servers are written
     path: Path | None = None  # the file the configuration was read from
+    policy: approval.Policy = approval.Policy()  # confirmation defaults ([confirm])
+    audit_log: Path | None = None  # None = no audit log
 
 
-def load_config(path: str | os.PathLike | None = None, output_dir: str | os.PathLike | None = None) -> Config:
+def load_config(
+    path: str | os.PathLike | None = None,
+    output_dir: str | os.PathLike | None = None,
+    approval_ttl: str | None = None,
+) -> Config:
     """Read the configuration from `path`, $SILA2_MCP_CONFIG, or ./servers.toml.
 
     The output directory is `output_dir`, else $SILA2_MCP_OUTPUT_DIR, else the file's top-level
     `output_dir`, else default_output_dir().
+
+    [confirm] sets the confirmation modes (commands, properties: none | every | once) and
+    approval_ttl_minutes (a number or "unlimited"; `approval_ttl` overrides it); a server's
+    `confirm = {commands = ..., properties = ...}` overrides the modes for that server.
+    The audit log is the top-level `audit_log` (a path, or false for none), else
+    approval.default_audit_log().
+
+    Raises:
+        ValueError: An invalid confirmation setting.
     """
     path = Path(path or os.environ.get("SILA2_MCP_CONFIG") or "servers.toml")
     with open(path, "rb") as f:
         data = tomllib.load(f)
+
+    confirm = data.get("confirm", {})
+    unknown = set(confirm) - {"commands", "properties", "approval_ttl_minutes"}
+    if unknown:
+        raise ValueError(f"{path}: unknown keys in [confirm]: {sorted(unknown)}")
+    ttl_source = approval_ttl if approval_ttl is not None else confirm.get("approval_ttl_minutes", 30)
+    policy = approval.Policy(
+        commands=approval.check_mode(confirm.get("commands", "once"), "[confirm] commands"),
+        properties=approval.check_mode(confirm.get("properties", "none"), "[confirm] properties"),
+        ttl_minutes=approval.parse_ttl_minutes(ttl_source),
+    )
+
     servers = {}
     for name, entry in data.get("servers", {}).items():
+        override = entry.get("confirm", {})
+        unknown = set(override) - {"commands", "properties"}
+        if unknown:
+            raise ValueError(f"{path}: unknown keys in servers.{name}.confirm: {sorted(unknown)}")
         servers[name] = ServerConfig(
             name=name,
             host=entry["host"],
@@ -72,12 +106,31 @@ def load_config(path: str | os.PathLike | None = None, output_dir: str | os.Path
             insecure=bool(entry.get("insecure", True)),
             root_cert=entry.get("root_cert"),
             description=entry.get("description", ""),
+            policy=approval.Policy(
+                commands=approval.check_mode(
+                    override.get("commands", policy.commands), f"servers.{name}.confirm.commands"
+                ),
+                properties=approval.check_mode(
+                    override.get("properties", policy.properties), f"servers.{name}.confirm.properties"
+                ),
+                ttl_minutes=policy.ttl_minutes,
+            ),
         )
+
     out = output_dir or os.environ.get("SILA2_MCP_OUTPUT_DIR") or data.get("output_dir")
+    audit = data.get("audit_log", True)
+    if audit is True:
+        audit_log: Path | None = approval.default_audit_log()
+    elif audit is False:
+        audit_log = None
+    else:
+        audit_log = Path(audit).expanduser()
     return Config(
         servers=servers,
         output_dir=Path(out).expanduser() if out else default_output_dir(),
         path=path.resolve(),
+        policy=policy,
+        audit_log=audit_log,
     )
 
 
@@ -486,6 +539,15 @@ def _find(pool: Pool, server: str, feature: str | None, member: str, kind: str):
     root = ET.fromstring(client._features[fid]._feature_definition)
     node = next(n for n in _children(root, kind) if _text(n, "Identifier") == member)
     return fid, getattr(getattr(client, fid), member), root, node
+
+
+def member_info(pool: Pool, server: str, kind: str, member: str, feature: str | None = None) -> tuple[str, str]:
+    """(feature identifier, first sentence of the description) of a command or property.
+
+    `kind` is "Command" or "Property". Raises SilaError like the calls themselves.
+    """
+    fid, _attr, _root, node = _find(pool, server, feature, member, kind)
+    return fid, _first_sentence(_text(node, "Description"))
 
 
 def _content_type(data_type: ET.Element | None, root: ET.Element, depth: int = 0) -> str | None:
