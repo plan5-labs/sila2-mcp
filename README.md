@@ -53,8 +53,15 @@ confirm = { commands = "every" }   # per-server override of the modes
 ```
 
 - Declined, dismissed, or not askable (the client has no form elicitation support): nothing
-  is run and the result has `ok: false`, `error.type: "NotApproved"`. A server that needs no
-  confirmation (e.g. a simulator) must be set to `none` explicitly.
+  is run and the result has `ok: false`, `error.type: "NotApproved"` and `error.reason`
+  `declined` / `dismissed` / `cannot_ask`. A server that needs no confirmation (e.g. a
+  simulator) must be set to `none` explicitly.
+- The question puts the call in its first line (`Run MoveRelative(DeltaPan=30, DeltaTilt=0) on
+  tapo?`), since clients may show only the first lines.
+- Claude Code shows the question in the terminal. The Claude Code VS Code extension currently
+  declines every elicitation automatically (a client-side issue), so there nothing runs with
+  `once` / `every`; a decline cannot be told apart from a person's, hence `declined` means "by
+  the user, or automatically by the client". See issue #4 for per-client policies.
 - Approvals live in the MCP server process: one session; restarting or reconnecting the server
   forgets them, and so does `revoke_approvals`. Nothing lets the model grant an approval.
 - On MCP 2026-07-28 connections the question travels as an `InputRequiredResult` and the

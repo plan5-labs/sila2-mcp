@@ -26,7 +26,7 @@ from mcp.server.mcpserver import (
     Resolve,
 )
 from mcp.server.mcpserver.exceptions import ToolError
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, ConfigDict, Field, create_model
 
 from . import approval, sila
 
@@ -63,23 +63,27 @@ def _get_pool() -> sila.Pool:
 # request on older ones. The tool body, and so the SiLA call, runs only after that.
 
 
-# The elicitation form in "every" mode: no fields, the user only accepts or declines.
-# (No docstring: pydantic would put it into the schema shown to the user.)
-Approval = create_model("Approval")
-
-
 def _ttl_text(ttl_minutes: float | None) -> str:
     return "until the MCP server restarts" if ttl_minutes is None else f"for {ttl_minutes:g} minutes"
 
 
+# The forms carry no docstrings: pydantic would put them into the schema shown to the user.
+
+
 @functools.cache
-def _once_form(ttl_minutes: float | None) -> type[BaseModel]:
-    """The elicitation form in "once" mode: Accept with "this time only" (ask again next time)
-    or "remember" (no more questions for this command for the approval period); Decline refuses.
-    "This time only" is preselected so that nothing is remembered by accident."""
+def _every_form(label: str) -> type[BaseModel]:
+    # "every" mode: no fields, the user only accepts or declines
+    return create_model("Approval", __config__=ConfigDict(title=label))
+
+
+@functools.cache
+def _once_form(ttl_minutes: float | None, kind: str, label: str) -> type[BaseModel]:
+    # "once" mode: Accept with "this time only" (ask again next time) or "remember" (no more
+    # questions for this command for the approval period); Decline refuses. "This time only" is
+    # preselected so that nothing is remembered by accident.
     choices = [
         {"const": "this_time", "title": "This time only"},
-        {"const": "remember", "title": f"This command {_ttl_text(ttl_minutes)}"},
+        {"const": "remember", "title": f"This {kind} {_ttl_text(ttl_minutes)}"},
     ]
 
     def titled(schema: dict[str, Any]) -> None:  # a titled single-select enum, as the spec defines it
@@ -88,7 +92,7 @@ def _once_form(ttl_minutes: float | None) -> type[BaseModel]:
 
     return create_model(
         "OnceApproval",
-        allow=(Literal["this_time", "remember"], Field("this_time", title="Allow", json_schema_extra=titled)),
+        allow=(Literal["this_time", "remember"], Field("this_time", title=label, json_schema_extra=titled)),
     )
 
 
@@ -107,10 +111,18 @@ def _elicitation_supported(ctx: Context) -> bool:
     return elicitation is not None and (elicitation.form is not None or elicitation.url is None)
 
 
-def _render_parameters(parameters: dict[str, Any] | None) -> str:
-    if not parameters:
-        return "  (no parameters)"
-    return "\n".join(f"  {k} = {json.dumps(v, ensure_ascii=False)}" for k, v in parameters.items())
+_VALUE_CHARS = 40  # a longer parameter value is shortened in the first line of the question
+
+
+def _call_text(member: str, parameters: dict[str, Any] | None) -> tuple[str, bool]:
+    """'MoveRelative(DeltaPan=30, DeltaTilt=0)', and whether a value had to be shortened."""
+    parts, shortened = [], False
+    for k, v in (parameters or {}).items():
+        text = json.dumps(v, ensure_ascii=False)
+        if len(text) > _VALUE_CHARS:
+            text, shortened = text[: _VALUE_CHARS - 3] + "...", True
+        parts.append(f"{k}={text}")
+    return f"{member}({', '.join(parts)})", shortened
 
 
 async def _gate(
@@ -141,25 +153,22 @@ async def _gate(
             f"{'commands' if kind == 'command' else 'properties'} = \"none\"}} for it in "
             f"{pool.config_path or 'servers.toml'}.",
         )
-    what = "Run a SiLA 2 command" if kind == "command" else "Read a SiLA 2 property"
-    lines = [
-        f"{what} on {server}?",
-        "",
-        f"Server: {server} ({cfg.host}:{cfg.port})" + (f" - {cfg.description}" if cfg.description else ""),
-        f"{kind.capitalize()}: {fid}.{member}",
-    ]
+    # Clients may show only the first few lines (Claude Code: "+N more lines"), so the first line
+    # names the call completely and there are no blank lines.
+    shortened = False
     if kind == "command":
-        lines.append(_render_parameters(parameters))
-    if summary:
-        lines.append(f"About: {summary}")
+        call, shortened = _call_text(member, parameters)
+        lines = [f"Run {call} on {server}?"]
+    else:
+        lines = [f"Read {member} on {server}?"]
+    lines.append(f"{fid}: {summary}" if summary else f"Feature: {fid}")
+    lines.append(f"Server: {server} ({cfg.host}:{cfg.port})" + (f" - {cfg.description}" if cfg.description else ""))
+    if shortened:
+        lines.append("Parameters: " + json.dumps(parameters, ensure_ascii=False))
+    label = f"Allow {member} on {server}"
     if policy.mode(kind) == "once":
-        lines += [
-            "",
-            f'Allow "this time only" to be asked again next time, or "this {kind}" to allow '
-            f"{fid}.{member} on {server} without asking again {_ttl_text(policy.ttl_minutes)}.",
-        ]
-        return Elicit("\n".join(lines), _once_form(policy.ttl_minutes))
-    return Elicit("\n".join(lines), Approval)
+        return Elicit("\n".join(lines), _once_form(policy.ttl_minutes, kind, label))
+    return Elicit("\n".join(lines), _every_form(label))
 
 
 async def _approve_command(
@@ -195,7 +204,11 @@ async def _admit(
             if data.status == "failed":
                 raise ToolError(data.reason)
             _audit.write("not_asked", reason=data.reason, **audit)
-            return {**base, "ok": False, "error": {"type": "NotApproved", "message": data.reason}}
+            return {
+                **base,
+                "ok": False,
+                "error": {"type": "NotApproved", "reason": "cannot_ask", "message": data.reason},
+            }
         # the user accepted
         pool = _get_pool()
         policy = pool.servers[server].policy
@@ -208,13 +221,17 @@ async def _admit(
             _approvals.grant((kind, server, fid, member))
         _audit.write("approved", mode=policy.mode(kind), scope=scope, **{**audit, "feature": fid})
         return None
+    # A decline may come from a person or from a client that declines automatically (e.g. one
+    # that cannot show the question); the protocol does not tell them apart.
     action = "declined" if outcome.action == "decline" else "dismissed"
     _audit.write(action, **audit)
-    return {
-        **base,
-        "ok": False,
-        "error": {"type": "NotApproved", "message": f"The user {action} the request; it was not run."},
-    }
+    message = (
+        "The request was declined (by the user, or automatically by an MCP client that cannot "
+        "show the question); it was not run."
+        if action == "declined"
+        else "The request was dismissed without an answer; it was not run."
+    )
+    return {**base, "ok": False, "error": {"type": "NotApproved", "reason": action, "message": message}}
 
 
 def _list_servers() -> list[dict[str, Any]]:
