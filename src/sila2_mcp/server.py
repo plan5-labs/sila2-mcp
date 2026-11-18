@@ -8,12 +8,13 @@ confirmation policy in servers.toml; the SiLA call runs only after an approval.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import logging
 import sys
 import time
 from dataclasses import dataclass
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import anyio
 from mcp.server.mcpserver import (
@@ -25,7 +26,7 @@ from mcp.server.mcpserver import (
     Resolve,
 )
 from mcp.server.mcpserver.exceptions import ToolError
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, create_model
 
 from . import approval, sila
 
@@ -62,8 +63,33 @@ def _get_pool() -> sila.Pool:
 # request on older ones. The tool body, and so the SiLA call, runs only after that.
 
 
-class Approval(BaseModel):
-    """The elicitation form: no fields, the user only accepts or declines."""
+# The elicitation form in "every" mode: no fields, the user only accepts or declines.
+# (No docstring: pydantic would put it into the schema shown to the user.)
+Approval = create_model("Approval")
+
+
+def _ttl_text(ttl_minutes: float | None) -> str:
+    return "until the MCP server restarts" if ttl_minutes is None else f"for {ttl_minutes:g} minutes"
+
+
+@functools.cache
+def _once_form(ttl_minutes: float | None) -> type[BaseModel]:
+    """The elicitation form in "once" mode: Accept with "this time only" (ask again next time)
+    or "remember" (no more questions for this command for the approval period); Decline refuses.
+    "This time only" is preselected so that nothing is remembered by accident."""
+    choices = [
+        {"const": "this_time", "title": "This time only"},
+        {"const": "remember", "title": f"This command {_ttl_text(ttl_minutes)}"},
+    ]
+
+    def titled(schema: dict[str, Any]) -> None:  # a titled single-select enum, as the spec defines it
+        schema.pop("enum", None)
+        schema["oneOf"] = choices
+
+    return create_model(
+        "OnceApproval",
+        allow=(Literal["this_time", "remember"], Field("this_time", title="Allow", json_schema_extra=titled)),
+    )
 
 
 @dataclass(frozen=True)
@@ -89,7 +115,7 @@ def _render_parameters(parameters: dict[str, Any] | None) -> str:
 
 async def _gate(
     ctx: Context, kind: approval.Kind, server: str, member: str, feature: str | None, parameters: dict[str, Any] | None
-) -> Gate | Elicit[Approval]:
+) -> Gate | Elicit[BaseModel]:
     pool = _get_pool()
     cfg = pool.servers.get(server)
     if cfg is None:
@@ -127,20 +153,24 @@ async def _gate(
     if summary:
         lines.append(f"About: {summary}")
     if policy.mode(kind) == "once":
-        ttl = "until the MCP server restarts" if policy.ttl_minutes is None else f"for {policy.ttl_minutes:g} minutes"
-        lines += ["", f"Accepting also allows {fid}.{member} on {server} without asking again {ttl}."]
+        lines += [
+            "",
+            f'Allow "this time only" to be asked again next time, or "this {kind}" to allow '
+            f"{fid}.{member} on {server} without asking again {_ttl_text(policy.ttl_minutes)}.",
+        ]
+        return Elicit("\n".join(lines), _once_form(policy.ttl_minutes))
     return Elicit("\n".join(lines), Approval)
 
 
 async def _approve_command(
     ctx: Context, server: str, command: str, parameters: dict[str, Any] | None, feature: str | None
-) -> Gate | Elicit[Approval]:
+) -> Gate | Elicit[BaseModel]:
     return await _gate(ctx, "command", server, command, feature, parameters)
 
 
 async def _approve_property(
     ctx: Context, server: str, property: str, feature: str | None
-) -> Gate | Elicit[Approval]:
+) -> Gate | Elicit[BaseModel]:
     return await _gate(ctx, "property", server, property, feature, None)
 
 
@@ -172,9 +202,11 @@ async def _admit(
         fid, _ = await anyio.to_thread.run_sync(
             sila.member_info, pool, server, "Command" if kind == "command" else "Property", member, feature
         )
-        if policy.mode(kind) == "once":
+        # "once" mode: remember only when the user chose so; "this time only" leaves it asking
+        scope = getattr(data, "allow", None) if policy.mode(kind) == "once" else None
+        if scope == "remember":
             _approvals.grant((kind, server, fid, member))
-        _audit.write("approved", mode=policy.mode(kind), **{**audit, "feature": fid})
+        _audit.write("approved", mode=policy.mode(kind), scope=scope, **{**audit, "feature": fid})
         return None
     action = "declined" if outcome.action == "decline" else "dismissed"
     _audit.write(action, **audit)
@@ -262,7 +294,7 @@ async def get_property(
     server: str,
     property: str,
     feature: str | None = None,
-    approval: Annotated[ElicitationResult[Approval], Resolve(_approve_property)] = None,  # type: ignore[assignment]
+    approval: Annotated[ElicitationResult[BaseModel], Resolve(_approve_property)] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Read a property's current value once (observable properties too).
 
@@ -287,7 +319,7 @@ async def call_command(
     parameters: dict[str, Any] | None = None,
     feature: str | None = None,
     timeout_s: float = 600.0,
-    approval: Annotated[ElicitationResult[Approval], Resolve(_approve_command)] = None,  # type: ignore[assignment]
+    approval: Annotated[ElicitationResult[BaseModel], Resolve(_approve_command)] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Run a SiLA 2 command and return its responses. MAY MOVE HARDWARE.
 

@@ -37,7 +37,7 @@ it). The SiLA call runs only after an approval.
 |---|---|
 | `none` | Never ask |
 | `every` | Ask each time |
-| `once` | Ask once per command (or property), then not again for `approval_ttl_minutes` |
+| `once` | Ask with three choices: Decline; Accept "this time only" (asked again next time); Accept "this command for N minutes" (not asked again for that command for `approval_ttl_minutes`). "This time only" is preselected |
 
 Defaults: commands `once`, property reads `none`, approvals kept for 30 minutes.
 
