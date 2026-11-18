@@ -24,3 +24,9 @@ host = "127.0.0.1"
 port = 50052
 insecure = true
 description = "Azenta XPeel plate seal remover (xpeel-sila2)"
+
+[servers.tapo]
+host = "127.0.0.1"
+port = 50054
+insecure = true
+description = "TP-Link Tapo C232 network camera (tapo-camera-controller): snapshots, video recording, pan/tilt"
