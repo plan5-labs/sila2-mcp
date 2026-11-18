@@ -75,8 +75,51 @@ confirm = { commands = "every" }   # per-server override of the modes
 - This is a software confirmation. It does not replace the physical safety measures of the
   instruments (interlocks, light curtains, emergency stops).
 
-With this in place, `call_command` can be allowed in the MCP client's own permissions, so the
-user is not asked twice.
+When the client shows the questions, `call_command` can be allowed in the MCP client's own
+permissions, so the user is not asked twice. Do this only after checking that the questions
+appear (see below).
+
+### Clients that cannot show the question (e.g. the Claude Code VS Code extension)
+
+Signs: every command returns `NotApproved` with `reason: "declined"` although nobody declined
+(no dialog appeared; the audit log shows `declined` within milliseconds of the call), or
+`reason: "cannot_ask"`.
+
+1. **Preferably, use a client that shows them.** Claude Code in a terminal does, including the
+   integrated terminal of VS Code: run `claude` there instead of using the extension's chat.
+2. **Otherwise, let the client's permission prompt be the confirmation.**
+   - Use a configuration that does not ask, e.g. a copy of `servers.toml` with
+     ```toml
+     [confirm]
+     commands = "none"
+     properties = "none"
+     ```
+     and register sila2-mcp with it:
+     ```sh
+     claude mcp add -s user sila2 -- uv --directory /path/to/sila2-mcp run sila2-mcp --config /path/to/servers-noconfirm.toml
+     ```
+   - Keep `mcp__sila2__call_command` out of `permissions.allow` (and, to be explicit, list it
+     in `permissions.ask`), so that Claude Code asks before every command; allow only the
+     reading tools:
+     ```json
+     {
+       "permissions": {
+         "allow": ["mcp__sila2__list_servers", "mcp__sila2__describe_server", "mcp__sila2__get_property"],
+         "ask": ["mcp__sila2__call_command"]
+       }
+     }
+     ```
+   - Do not use permission modes that may run tool calls without asking (e.g. auto mode,
+     bypassPermissions) while instruments are connected: commands would then run with nobody
+     asked.
+   - What changes: the client asks once per call of `call_command`, for every command
+     alike (no `once`, no "this time only"), showing the tool arguments (server, command,
+     parameters). The audit log still records every executed command.
+   - The registration (`-s user`) is shared by all Claude Code clients of the user, so the
+     terminal then does not ask either. Switch back to the normal configuration when you use the
+     terminal, or register the no-confirmation configuration with `-s local` in one project
+     directory only (a local registration of the same name takes precedence there, for every
+     client opened in that directory). Per-client policies are planned in issue #4.
 
 ## Setup
 
@@ -103,6 +146,10 @@ Binary responses go to `--output-dir`, else `$SILA2_MCP_OUTPUT_DIR`, else a top-
 ```sh
 claude mcp add sila2 -- uv --directory /path/to/sila2-mcp run sila2-mcp
 ```
+
+Use it from Claude Code in a terminal, where the approval questions are shown (see
+[Clients that cannot show the question](#clients-that-cannot-show-the-question-eg-the-claude-code-vs-code-extension)
+for the VS Code extension).
 
 The server talks MCP over stdio. Connections to the SiLA 2 servers are opened on first use
 and kept; after a SiLA 2 server restarts, the next failing call drops the connection and the
